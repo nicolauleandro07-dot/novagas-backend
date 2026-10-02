@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#123d31">
+<title>NovaGás Investimentos</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="toast"></div>
+
+<section id="auth" class="auth">
+  <div class="auth-card">
+    <div class="brand brand-image"><img src="/novagas-brand.png" alt="NovaGás Investimentos"><div><b>NovaGás</b><small>Investimentos</small></div></div>
+    <h1>Bem-vindo</h1>
+    <p class="muted">Aceda à sua conta com segurança.</p>
+    <form id="loginForm">
+      <label>Telemóvel<input id="loginPhone" placeholder="+244 9XXXXXXXX" required></label>
+      <label>Palavra-passe<div class="password-wrap"><input id="loginPassword" type="password" placeholder="••••••••" required><button type="button" class="password-toggle" data-password="loginPassword" aria-label="Mostrar palavra-passe" aria-pressed="false">👁</button></div></label>
+      <button class="primary">Entrar</button>
+    </form>
+    <div class="switch">Ainda não tem conta? <button id="showRegister">Cadastrar</button></div>
+    <div class="notice">NovaGás é uma plataforma independente. Operações financeiras devem ser confirmadas por provedores autorizados.</div>
+  </div>
+</section>
+
+<section id="register" class="auth hidden">
+  <div class="auth-card">
+    <div class="brand brand-image"><img src="/novagas-brand.png" alt="NovaGás Investimentos"><div><b>NovaGás</b><small>Investimentos</small></div></div>
+    <h1>Criar conta</h1>
+    <form id="registerForm">
+      <label>Nome completo<input id="regName" required></label>
+      <label>Telemóvel<input id="regPhone" placeholder="+244 9XXXXXXXX" required></label>
+      <label>Email (opcional)<input id="regEmail" type="email"></label>
+      <label>Palavra-passe<div class="password-wrap"><input id="regPassword" type="password" minlength="8" required><button type="button" class="password-toggle" data-password="regPassword" aria-label="Mostrar palavra-passe" aria-pressed="false">👁</button></div></label>
+      <div id="referralField" class="hidden referral-field"><label>Código de convite<input id="regRef" readonly></label><small class="muted2">Este código foi identificado pelo link de indicação.</small></div>
+      <button class="primary">Criar conta</button>
+    </form>
+    <div class="switch">Já tem conta? <button id="showLogin">Entrar</button></div>
+  </div>
+</section>
+
+<main id="app" class="hidden">
+<header class="topbar">
+  <div class="brand"><span class="brand-mark">NG</span><div><b>NovaGás</b><small>Investimentos</small></div></div>
+  <button id="logout" class="icon-btn">↪</button>
+</header>
+
+<div id="page-home" class="page"></div>
+<div id="page-invest" class="page hidden"></div>
+<div id="page-team" class="page hidden"></div>
+<div id="page-tasks" class="page hidden"></div>
+<div id="page-account" class="page hidden"></div>
+
+<nav class="bottom">
+  <button data-page="home">⌂<span>Início</span></button>
+  <button data-page="invest">▣<span>Investir</span></button>
+  <button data-page="team">♢<span>Equipa</span></button>
+  <button data-page="tasks">✓<span>Tarefas</span></button>
+  <button data-page="account">◉<span>Conta</span></button>
+</nav>
+</main>
+<script src="/config.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
