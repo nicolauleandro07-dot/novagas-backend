@@ -8,201 +8,60 @@ import jwt from "jsonwebtoken";
 import crypto from "node:crypto";
 import db from "./db.js";
 
-const app = express();
-const PORT = Number(process.env.PORT || 3000);
-const JWT_SECRET = process.env.JWT_SECRET || "dev-only-change-me";
-
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: process.env.CORS_ORIGIN || true }));
-app.use(express.json({ limit: "100kb" }));
+const app=express();
+const PORT=Number(process.env.PORT||3000);
+const JWT_SECRET=process.env.JWT_SECRET||"dev-only-change-me";
+app.use(helmet({contentSecurityPolicy:false}));
+app.use(cors({origin:process.env.CORS_ORIGIN||true}));
+app.use(express.json({limit:"100kb"}));
 app.use(express.static("public"));
-app.use("/api/", rateLimit({ windowMs: 15*60*1000, limit: 250 }));
+app.use("/api/",rateLimit({windowMs:15*60*1000,limit:250,standardHeaders:true,legacyHeaders:false}));
+const money=n=>Math.round(Number(n)*100);
+const fmt=c=>Number(c||0)/100;
+const sign=u=>jwt.sign({id:u.id,role:u.role},JWT_SECRET,{expiresIn:"7d"});
+const ref=prefix=>prefix+"-"+crypto.randomBytes(6).toString("hex").toUpperCase();
+function auth(req,res,next){const h=req.headers.authorization||"";if(!h.startsWith("Bearer "))return res.status(401).json({error:"Não autenticado"});try{req.user=jwt.verify(h.slice(7),JWT_SECRET);next()}catch{return res.status(401).json({error:"Sessão inválida"})}}
+function admin(req,res,next){if(req.user.role!=="admin")return res.status(403).json({error:"Acesso administrativo necessário"});next()}
+function setting(key){return db.prepare("SELECT value FROM settings WHERE key=?").get(key)?.value ?? "0"}
+function settingNum(key){return Number(setting(key)||0)}
+function wallet(userId){return db.prepare("SELECT available_cents,invested_cents,reserved_cents,bonus_cents FROM wallets WHERE user_id=?").get(userId)}
+function idem(req){return String(req.headers["idempotency-key"]||req.body?.idempotencyKey||"").trim().slice(0,100)||null}
 
-const money = n => Math.round(Number(n) * 100);
-const sign = user => jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: "7d" });
+app.get("/api/health",(req,res)=>res.json({ok:true,service:"NovaGás Backend",mode:setting("finance_mode")==="test_manual"?"test":"production-ready"}));
+app.get("/api/referrals/validate",(req,res)=>{const c=String(req.query.code||"").trim().toUpperCase();if(!/^[A-Z0-9]{8,14}$/.test(c))return res.json({valid:false});res.json({valid:!!db.prepare("SELECT id FROM users WHERE referral_code=?").get(c)})});
 
-function auth(req, res, next) {
-  const h = req.headers.authorization || "";
-  if (!h.startsWith("Bearer ")) return res.status(401).json({error:"Não autenticado"});
-  try { req.user = jwt.verify(h.slice(7), JWT_SECRET); next(); }
-  catch { return res.status(401).json({error:"Sessão inválida"}); }
-}
-function admin(req,res,next) {
-  if (req.user.role !== "admin") return res.status(403).json({error:"Acesso administrativo necessário"});
-  next();
-}
-function code() { return crypto.randomBytes(4).toString("hex").toUpperCase(); }
+app.post("/api/auth/register",(req,res)=>{const{name,phone,email,password,referralCode}=req.body;if(!name||!phone||!password||password.length<8)return res.status(400).json({error:"Nome, telefone e senha (mín. 8 caracteres) são obrigatórios."});if(!/^\+244\d{9}$/.test(phone))return res.status(400).json({error:"Telefone deve estar no formato +244XXXXXXXXX."});try{const r=referralCode?db.prepare("SELECT id FROM users WHERE referral_code=?").get(String(referralCode).trim().toUpperCase()):null;const info=db.prepare("INSERT INTO users(name,phone,email,password_hash,referral_code,referred_by) VALUES(?,?,?,?,?,?)").run(name.trim(),phone,email?.trim()||null,bcrypt.hashSync(password,12),crypto.randomBytes(4).toString("hex").toUpperCase(),r?.id||null);db.prepare("INSERT INTO wallets(user_id) VALUES(?)").run(info.lastInsertRowid);if(r)db.prepare("INSERT INTO referrals(inviter_id,invited_id) VALUES(?,?)").run(r.id,info.lastInsertRowid);const u=db.prepare("SELECT id,name,phone,email,role,vip_level,referral_code FROM users WHERE id=?").get(info.lastInsertRowid);res.status(201).json({token:sign(u),user:u})}catch{res.status(409).json({error:"Telefone ou email já está registado."})}});
+app.post("/api/auth/login",(req,res)=>{const{phone,password}=req.body;const u=db.prepare("SELECT * FROM users WHERE phone=?").get(phone);if(!u||!bcrypt.compareSync(password||"",u.password_hash))return res.status(401).json({error:"Credenciais inválidas."});res.json({token:sign(u),user:{id:u.id,name:u.name,phone:u.phone,email:u.email,role:u.role,vip_level:u.vip_level,referral_code:u.referral_code}})});
+app.get("/api/me",auth,(req,res)=>res.json({user:db.prepare("SELECT id,name,phone,email,role,vip_level,referral_code,created_at FROM users WHERE id=?").get(req.user.id),wallet:wallet(req.user.id)}));
+app.get("/api/products",auth,(req,res)=>res.json(db.prepare("SELECT * FROM products WHERE active=1 ORDER BY id").all()));
+app.get("/api/dashboard",auth,(req,res)=>{const w=wallet(req.user.id);const investments=db.prepare("SELECT i.*,p.name,p.category FROM investments i JOIN products p ON p.id=i.product_id WHERE i.user_id=? ORDER BY i.id DESC").all(req.user.id);const transactions=db.prepare("SELECT * FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 50").all(req.user.id);const referrals=db.prepare("SELECT COUNT(*) c FROM referrals WHERE inviter_id=?").get(req.user.id).c;res.json({wallet:w,investments,transactions,referrals,financialRules:{depositMinKz:fmt(settingNum("deposit_min_cents")),investmentMinKz:fmt(settingNum("investment_min_cents")),withdrawalMinKz:fmt(settingNum("withdrawal_min_cents")),withdrawalFeePercent:settingNum("withdrawal_fee_bps")/100,financeMode:setting("finance_mode")}})});
 
-app.get("/api/health", (req,res) => res.json({ok:true,service:"NovaGás Backend"}));
+app.get("/api/finance/instructions",auth,(req,res)=>res.json({mode:setting("finance_mode"),bank:{name:setting("bank_name"),accountName:setting("bank_account_name"),accountNumber:setting("bank_account_number"),iban:setting("bank_iban")},instructions:setting("deposit_instructions")}));
 
-app.get("/api/referrals/validate", (req,res) => {
-  const referralCode = String(req.query.code || "").trim().toUpperCase();
-  if (!/^[A-Z0-9]{8}$/.test(referralCode)) return res.json({valid:false});
-  const ref = db.prepare("SELECT id FROM users WHERE referral_code=?").get(referralCode);
-  res.json({valid:!!ref});
-});
+app.post("/api/deposits",auth,(req,res)=>{const amount=Number(req.body.amount);const cents=money(amount);const min=settingNum("deposit_min_cents");if(!Number.isFinite(amount)||cents<min)return res.status(400).json({error:`Depósito mínimo: ${fmt(min).toLocaleString("pt-AO")} Kz.`});const key=idem(req);if(key){const old=db.prepare("SELECT id,provider_reference,status,amount_cents FROM transactions WHERE user_id=? AND idempotency_key=?").get(req.user.id,key);if(old)return res.status(200).json({id:old.id,reference:old.provider_reference,status:old.status,amountKz:fmt(old.amount_cents),message:"Pedido já registado."})}const reference=ref("DEP");try{const info=db.prepare("INSERT INTO transactions(user_id,type,amount_cents,net_amount_cents,status,provider,provider_reference,description,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?)").run(req.user.id,"deposit",cents,cents,"pending","manual_bank_test",reference,"Depósito pendente: confirmar entrada bancária antes de creditar.",key);res.status(201).json({id:info.lastInsertRowid,reference,status:"pending",amountKz:amount,instructions:setting("deposit_instructions"),message:"Pedido pendente. Nenhum saldo foi creditado automaticamente."})}catch(e){res.status(409).json({error:"Este pedido já foi enviado ou a chave de idempotência já foi usada."})}});
 
-app.post("/api/auth/register", (req,res) => {
-  const {name, phone, email, password, referralCode} = req.body;
-  if (!name || !phone || !password || password.length < 8) return res.status(400).json({error:"Nome, telefone e senha (mín. 8 caracteres) são obrigatórios."});
-  if (!/^\+244\d{9}$/.test(phone)) return res.status(400).json({error:"Telefone deve estar no formato +244XXXXXXXXX."});
-  try {
-    const ref = referralCode ? db.prepare("SELECT id FROM users WHERE referral_code=?").get(referralCode.trim().toUpperCase()) : null;
-    const hash = bcrypt.hashSync(password, 12);
-    const referral = ref?.id || null;
-    const referralCodeNew = code();
-    const info = db.prepare(`
-      INSERT INTO users(name,phone,email,password_hash,referral_code,referred_by)
-      VALUES(?,?,?,?,?,?)
-    `).run(name.trim(), phone, email?.trim() || null, hash, referralCodeNew, referral);
-    db.prepare("INSERT INTO wallets(user_id) VALUES(?)").run(info.lastInsertRowid);
-    if (referral) db.prepare("INSERT INTO referrals(inviter_id,invited_id) VALUES(?,?)").run(referral, info.lastInsertRowid);
-    const user = db.prepare("SELECT id,name,phone,email,role,vip_level,referral_code FROM users WHERE id=?").get(info.lastInsertRowid);
-    res.status(201).json({token:sign(user), user});
-  } catch (e) {
-    res.status(409).json({error:"Telefone ou email já está registado."});
-  }
-});
+app.post("/api/withdrawals",auth,(req,res)=>{const amount=Number(req.body.amount);const cents=money(amount);const min=settingNum("withdrawal_min_cents");if(!Number.isFinite(amount)||cents<min)return res.status(400).json({error:`Levantamento mínimo: ${fmt(min).toLocaleString("pt-AO")} Kz.`});const destination=String(req.body.destination||"").trim();if(destination.length<4)return res.status(400).json({error:"Indique uma conta/IBAN de destino válida para o teste."});const key=idem(req);if(key){const old=db.prepare("SELECT id,provider_reference,status,amount_cents FROM transactions WHERE user_id=? AND idempotency_key=?").get(req.user.id,key);if(old)return res.status(200).json({id:old.id,reference:old.provider_reference,status:old.status,amountKz:fmt(old.amount_cents),message:"Pedido já registado."})}const w=wallet(req.user.id);if(cents>w.available_cents)return res.status(400).json({error:"Saldo disponível insuficiente."});const fee=Math.floor(cents*settingNum("withdrawal_fee_bps")/10000);const net=cents-fee;const reference=ref("WD");try{db.transaction(()=>{const before=w.available_cents;const changed=db.prepare("UPDATE wallets SET available_cents=available_cents-?,reserved_cents=reserved_cents+? WHERE user_id=? AND available_cents>=?").run(cents,cents,req.user.id,cents);if(changed.changes!==1)throw new Error("BALANCE_RACE");const info=db.prepare("INSERT INTO transactions(user_id,type,amount_cents,fee_cents,net_amount_cents,status,provider,provider_reference,destination,description,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(req.user.id,"withdrawal",cents,fee,net,"pending","manual_bank_test",reference,destination,"Levantamento pendente: pagar externamente e confirmar.",key);db.prepare("INSERT INTO ledger_entries(transaction_id,user_id,account,direction,amount_cents,balance_before_cents,balance_after_cents,note) VALUES(?,?,?,?,?,?,?,?)").run(info.lastInsertRowid,req.user.id,"available","debit",cents,before,before-cents,"Reserva para levantamento")})()}catch(e){return res.status(409).json({error:"Não foi possível reservar o saldo. Tente novamente."})}res.status(201).json({reference,status:"pending",requestedKz:amount,feeKz:fmt(fee),netKz:fmt(net),message:"Pedido pendente; o saldo foi reservado e ainda não foi pago."})});
 
-app.post("/api/auth/login", (req,res) => {
-  const {phone,password} = req.body;
-  const user = db.prepare("SELECT * FROM users WHERE phone=?").get(phone);
-  if (!user || !bcrypt.compareSync(password || "", user.password_hash)) return res.status(401).json({error:"Credenciais inválidas."});
-  const safe = {id:user.id,name:user.name,phone:user.phone,email:user.email,role:user.role,vip_level:user.vip_level,referral_code:user.referral_code};
-  res.json({token:sign(user), user:safe});
-});
+app.post("/api/investments",auth,(req,res)=>{const product=db.prepare("SELECT * FROM products WHERE id=? AND active=1").get(Number(req.body.productId));if(!product)return res.status(404).json({error:"Produto não encontrado."});if(product.price_cents<settingNum("investment_min_cents"))return res.status(400).json({error:"Este produto está abaixo do investimento mínimo configurado."});const w=wallet(req.user.id);if(w.available_cents<product.price_cents)return res.status(400).json({error:"Saldo disponível insuficiente."});const expected=product.price_cents+Math.floor(product.price_cents*product.daily_rate_bps/10000*product.duration_days);const end=new Date(Date.now()+product.duration_days*86400000).toISOString();db.transaction(()=>{const before=w.available_cents;db.prepare("UPDATE wallets SET available_cents=available_cents-?,invested_cents=invested_cents+? WHERE user_id=? AND available_cents>=?").run(product.price_cents,product.price_cents,req.user.id,product.price_cents);const tx=db.prepare("INSERT INTO transactions(user_id,type,amount_cents,net_amount_cents,status,provider,provider_reference,description) VALUES(?,?,?,?,?,?,?,?)").run(req.user.id,"investment",product.price_cents,product.price_cents,"completed","internal",ref("INV"),`Investimento em ${product.name}`);db.prepare("INSERT INTO ledger_entries(transaction_id,user_id,account,direction,amount_cents,balance_before_cents,balance_after_cents,note) VALUES(?,?,?,?,?,?,?,?)").run(tx.lastInsertRowid,req.user.id,"available","debit",product.price_cents,before,before-product.price_cents,"Aplicação em investimento") ;db.prepare("INSERT INTO investments(user_id,product_id,amount_cents,expected_return_cents,ends_at) VALUES(?,?,?,?,?)").run(req.user.id,product.id,product.price_cents,expected,end)})();res.status(201).json({message:"Investimento de teste registado.",expectedReturnCents:expected})});
 
-app.get("/api/me", auth, (req,res) => {
-  const user = db.prepare("SELECT id,name,phone,email,role,vip_level,referral_code,created_at FROM users WHERE id=?").get(req.user.id);
-  const wallet = db.prepare("SELECT * FROM wallets WHERE user_id=?").get(req.user.id);
-  res.json({user,wallet});
-});
+app.get("/api/tasks",auth,(req,res)=>res.json(db.prepare("SELECT t.*,CASE WHEN c.id IS NULL THEN 0 ELSE 1 END completed FROM tasks t LEFT JOIN task_claims c ON c.task_id=t.id AND c.user_id=? WHERE t.active=1").all(req.user.id)));
+app.post("/api/tasks/:id/complete",auth,(req,res)=>{const t=db.prepare("SELECT * FROM tasks WHERE id=? AND active=1").get(req.params.id);if(!t)return res.status(404).json({error:"Tarefa não encontrada."});try{db.transaction(()=>{db.prepare("INSERT INTO task_claims(task_id,user_id) VALUES(?,?)").run(t.id,req.user.id);const w=wallet(req.user.id);db.prepare("UPDATE wallets SET bonus_cents=bonus_cents+? WHERE user_id=?").run(t.reward_cents,req.user.id);const tx=db.prepare("INSERT INTO transactions(user_id,type,amount_cents,net_amount_cents,status,provider,provider_reference,description) VALUES(?,?,?,?,?,?,?,?)").run(req.user.id,"bonus",t.reward_cents,t.reward_cents,"completed","internal",ref("BON"),`Bónus de tarefa: ${t.title}`);db.prepare("INSERT INTO ledger_entries(transaction_id,user_id,account,direction,amount_cents,balance_before_cents,balance_after_cents,note) VALUES(?,?,?,?,?,?,?,?)").run(tx.lastInsertRowid,req.user.id,"bonus","credit",t.reward_cents,w.bonus_cents,w.bonus_cents+t.reward_cents,"Recompensa de teste")})();res.json({message:"Tarefa concluída. Recompensa de teste registada."})}catch{res.status(409).json({error:"Tarefa já concluída."})}});
+app.get("/api/team",auth,(req,res)=>{const u=db.prepare("SELECT referral_code FROM users WHERE id=?").get(req.user.id);res.json({code:u.referral_code,link:`${req.protocol}://${req.get("host")}/?ref=${u.referral_code}`,members:db.prepare("SELECT u.name,u.created_at,r.level,r.commission_bps,r.commission_cents FROM referrals r JOIN users u ON u.id=r.invited_id WHERE r.inviter_id=? ORDER BY r.id DESC").all(req.user.id)})});
+app.get("/api/transactions/:id",auth,(req,res)=>{const t=db.prepare("SELECT * FROM transactions WHERE id=? AND user_id=?").get(req.params.id,req.user.id);if(!t)return res.status(404).json({error:"Transação não encontrada."});res.json({transaction:t,ledger:db.prepare("SELECT * FROM ledger_entries WHERE transaction_id=? ORDER BY id").all(t.id)})});
 
-app.get("/api/products", auth, (req,res) => {
-  res.json(db.prepare("SELECT * FROM products WHERE active=1 ORDER BY id").all());
-});
+// ADMIN FINANCE
+app.get("/api/admin/transactions",auth,admin,(req,res)=>res.json(db.prepare("SELECT t.*,u.name,u.phone FROM transactions t JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 200").all()));
+app.get("/api/admin/financial-settings",auth,admin,(req,res)=>res.json({depositMinKz:fmt(settingNum("deposit_min_cents")),investmentMinKz:fmt(settingNum("investment_min_cents")),withdrawalMinKz:fmt(settingNum("withdrawal_min_cents")),withdrawalFeePercent:settingNum("withdrawal_fee_bps")/100,financeMode:setting("finance_mode"),bank:{name:setting("bank_name"),accountName:setting("bank_account_name"),accountNumber:setting("bank_account_number"),iban:setting("bank_iban")},depositInstructions:setting("deposit_instructions")}));
+app.post("/api/admin/financial-settings",auth,admin,(req,res)=>{const updates={deposit_min_cents:money(req.body.depositMinKz),investment_min_cents:money(req.body.investmentMinKz),withdrawal_min_cents:money(req.body.withdrawalMinKz),withdrawal_fee_bps:Math.round(Number(req.body.withdrawalFeePercent)*100),bank_name:String(req.body.bankName||""),bank_account_name:String(req.body.bankAccountName||""),bank_account_number:String(req.body.bankAccountNumber||""),bank_iban:String(req.body.bankIban||""),deposit_instructions:String(req.body.depositInstructions||""),finance_mode:String(req.body.financeMode||"test_manual")};if(!["test_manual","manual_bank"].includes(updates.finance_mode))return res.status(400).json({error:"Modo financeiro inválido."});if([updates.deposit_min_cents,updates.investment_min_cents,updates.withdrawal_min_cents,updates.withdrawal_fee_bps].some(v=>!Number.isFinite(v)||v<0))return res.status(400).json({error:"Configuração financeira inválida."});const s=db.prepare("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");db.transaction(()=>Object.entries(updates).forEach(([k,v])=>s.run(k,String(v))))();res.json({message:"Configurações financeiras atualizadas."})});
 
-app.get("/api/dashboard", auth, (req,res) => {
-  const wallet = db.prepare("SELECT * FROM wallets WHERE user_id=?").get(req.user.id);
-  const investments = db.prepare(`
-    SELECT i.*, p.name, p.category FROM investments i JOIN products p ON p.id=i.product_id
-    WHERE i.user_id=? ORDER BY i.id DESC
-  `).all(req.user.id);
-  const transactions = db.prepare("SELECT * FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 20").all(req.user.id);
-  const referrals = db.prepare("SELECT COUNT(*) c FROM referrals WHERE inviter_id=?").get(req.user.id).c;
-  res.json({wallet,investments,transactions,referrals});
-});
+function adminProcess(id,action,body,res){const t=db.prepare("SELECT * FROM transactions WHERE id=?").get(id);if(!t||t.status!=="pending")return res.status(400).json({error:"Transação inexistente ou já processada."});const note=String(body?.note||"").trim();const externalRef=String(body?.paymentReference||body?.providerReference||"").trim();if((t.type==="withdrawal"||t.type==="deposit")&&!externalRef)return res.status(400).json({error:"Informe a referência da operação bancária para concluir esta transação."});try{db.transaction(()=>{const status=action==="approve"?"completed":"rejected";const updated=db.prepare("UPDATE transactions SET status=?,completed_at=CURRENT_TIMESTAMP,description=TRIM(COALESCE(description,'')||CASE WHEN ?<>'' THEN ' | ADM: '||? ELSE '' END),provider_reference=COALESCE(?,provider_reference) WHERE id=? AND status='pending'").run(status,note,note,externalRef||null,t.id);if(updated.changes!==1)throw new Error("ALREADY");if(t.type==="deposit"&&action==="approve"){const w=wallet(t.user_id);const before=w.available_cents;db.prepare("UPDATE wallets SET available_cents=available_cents+? WHERE user_id=?").run(t.amount_cents,t.user_id);db.prepare("INSERT INTO ledger_entries(transaction_id,user_id,account,direction,amount_cents,balance_before_cents,balance_after_cents,note) VALUES(?,?,?,?,?,?,?,?)").run(t.id,t.user_id,"available","credit",t.amount_cents,before,before+t.amount_cents,"Depósito confirmado pelo ADM")}
+if(t.type==="withdrawal"){const w=wallet(t.user_id);if(action==="approve"){const before=w.reserved_cents;const changed=db.prepare("UPDATE wallets SET reserved_cents=reserved_cents-? WHERE user_id=? AND reserved_cents>=?").run(t.amount_cents,t.user_id,t.amount_cents);if(changed.changes!==1)throw new Error("RESERVED");db.prepare("INSERT INTO ledger_entries(transaction_id,user_id,account,direction,amount_cents,balance_before_cents,balance_after_cents,note) VALUES(?,?,?,?,?,?,?,?)").run(t.id,t.user_id,"reserved","debit",t.amount_cents,before,before-t.amount_cents,"Levantamento pago/confirmado pelo ADM")}
+else{const before=w.available_cents;const changed=db.prepare("UPDATE wallets SET available_cents=available_cents+?,reserved_cents=reserved_cents-? WHERE user_id=? AND reserved_cents>=?").run(t.amount_cents,t.amount_cents,t.user_id,t.amount_cents);if(changed.changes!==1)throw new Error("RESERVED");db.prepare("INSERT INTO ledger_entries(transaction_id,user_id,account,direction,amount_cents, balance_before_cents,balance_after_cents,note) VALUES(?,?,?,?,?,?,?,?)").run(t.id,t.user_id,"available","credit",t.amount_cents,before,before+t.amount_cents,"Levantamento rejeitado; reserva devolvida")}}
+})()}catch(e){return res.status(409).json({error:"Não foi possível processar a transação. Ela pode já ter sido processada."})}res.json({message:action==="approve"?"Transação aprovada no modo de teste/manual.":"Transação rejeitada e, quando aplicável, a reserva foi devolvida."})}
+app.post("/api/admin/transactions/:id/approve",auth,admin,(req,res)=>adminProcess(req.params.id,"approve",req.body,res));
+app.post("/api/admin/transactions/:id/reject",auth,admin,(req,res)=>adminProcess(req.params.id,"reject",req.body,res));
+// Backward-compatible endpoint used by the earlier frontend.
+app.post("/api/admin/transactions/:id/complete",auth,admin,(req,res)=>adminProcess(req.params.id,"approve",req.body,res));
 
-app.post("/api/deposits", auth, (req,res) => {
-  const amount = Number(req.body.amount);
-  if (!Number.isFinite(amount) || amount < 1000) return res.status(400).json({error:"Valor mínimo: 1.000 Kz."});
-  const ref = "DEP-" + crypto.randomBytes(6).toString("hex").toUpperCase();
-  const info = db.prepare(`
-    INSERT INTO transactions(user_id,type,amount_cents,status,provider,provider_reference,description)
-    VALUES(?,?,?,?,?,?,?)
-  `).run(req.user.id,"deposit",money(amount),"pending","pending_provider",ref,"Pedido de depósito");
-  res.status(201).json({id:info.lastInsertRowid,reference:ref,status:"pending",message:"Pedido criado. O saldo só será creditado após confirmação do provedor."});
-});
-
-app.post("/api/withdrawals", auth, (req,res) => {
-  const amount = Number(req.body.amount);
-  if (!Number.isFinite(amount) || amount < 3000) return res.status(400).json({error:"Valor mínimo de levantamento: 3.000 Kz."});
-  const wallet = db.prepare("SELECT available_cents FROM wallets WHERE user_id=?").get(req.user.id);
-  if (money(amount) > wallet.available_cents) return res.status(400).json({error:"Saldo disponível insuficiente."});
-  const ref = "WD-" + crypto.randomBytes(6).toString("hex").toUpperCase();
-  const tx = db.transaction(() => {
-    db.prepare("UPDATE wallets SET available_cents=available_cents-? WHERE user_id=?").run(money(amount),req.user.id);
-    db.prepare(`
-      INSERT INTO transactions(user_id,type,amount_cents,status,provider,provider_reference,description)
-      VALUES(?,?,?,?,?,?,?)
-    `).run(req.user.id,"withdrawal",money(amount),"pending","pending_provider",ref,"Pedido de levantamento");
-  });
-  tx();
-  res.status(201).json({reference:ref,status:"pending",message:"Pedido de levantamento criado e enviado para processamento."});
-});
-
-app.post("/api/investments", auth, (req,res) => {
-  const productId = Number(req.body.productId);
-  const product = db.prepare("SELECT * FROM products WHERE id=? AND active=1").get(productId);
-  if (!product) return res.status(404).json({error:"Produto não encontrado."});
-  const wallet = db.prepare("SELECT available_cents FROM wallets WHERE user_id=?").get(req.user.id);
-  if (wallet.available_cents < product.price_cents) return res.status(400).json({error:"Saldo disponível insuficiente."});
-  const expected = product.price_cents + Math.floor(product.price_cents * product.daily_rate_bps/10000 * product.duration_days);
-  const end = new Date(Date.now()+product.duration_days*86400000).toISOString();
-  const tx = db.transaction(() => {
-    db.prepare("UPDATE wallets SET available_cents=available_cents-?, invested_cents=invested_cents+? WHERE user_id=?").run(product.price_cents,product.price_cents,req.user.id);
-    db.prepare(`
-      INSERT INTO investments(user_id,product_id,amount_cents,expected_return_cents,ends_at)
-      VALUES(?,?,?,?,?)
-    `).run(req.user.id,product.id,product.price_cents,expected,end);
-  });
-  tx();
-  res.status(201).json({message:"Investimento registado.",expectedReturnCents:expected});
-});
-
-app.get("/api/tasks", auth, (req,res) => {
-  const rows = db.prepare(`
-    SELECT t.*, CASE WHEN c.id IS NULL THEN 0 ELSE 1 END completed
-    FROM tasks t LEFT JOIN task_claims c ON c.task_id=t.id AND c.user_id=?
-    WHERE t.active=1
-  `).all(req.user.id);
-  res.json(rows);
-});
-
-app.post("/api/tasks/:id/complete", auth, (req,res) => {
-  const task = db.prepare("SELECT * FROM tasks WHERE id=? AND active=1").get(req.params.id);
-  if (!task) return res.status(404).json({error:"Tarefa não encontrada."});
-  try {
-    const tx = db.transaction(() => {
-      db.prepare("INSERT INTO task_claims(task_id,user_id) VALUES(?,?)").run(task.id,req.user.id);
-      db.prepare("UPDATE wallets SET bonus_cents=bonus_cents+? WHERE user_id=?").run(task.reward_cents,req.user.id);
-    });
-    tx();
-    res.json({message:"Tarefa concluída. Recompensa registada."});
-  } catch { res.status(409).json({error:"Tarefa já concluída."}); }
-});
-
-app.get("/api/team", auth, (req,res) => {
-  const user = db.prepare("SELECT referral_code FROM users WHERE id=?").get(req.user.id);
-  const rows = db.prepare(`
-    SELECT u.name,u.created_at,r.level,r.commission_bps,r.commission_cents
-    FROM referrals r JOIN users u ON u.id=r.invited_id
-    WHERE r.inviter_id=? ORDER BY r.id DESC
-  `).all(req.user.id);
-  res.json({code:user.referral_code,link:`${req.protocol}://${req.get("host")}/?ref=${user.referral_code}`,commissionLevels:[30,5,1],members:rows});
-});
-
-/* ADMIN: only transaction state changes performed here.
-   In production, provider webhooks should be verified and idempotent. */
-app.get("/api/admin/transactions", auth, admin, (req,res) => {
-  res.json(db.prepare(`
-    SELECT t.*,u.name,u.phone FROM transactions t JOIN users u ON u.id=t.user_id
-    ORDER BY t.id DESC LIMIT 100
-  `).all());
-});
-
-app.post("/api/admin/transactions/:id/complete", auth, admin, (req,res) => {
-  const tx = db.prepare("SELECT * FROM transactions WHERE id=?").get(req.params.id);
-  if (!tx || tx.status !== "pending") return res.status(400).json({error:"Transação inválida."});
-  const run = db.transaction(() => {
-    if (tx.type === "deposit") db.prepare("UPDATE wallets SET available_cents=available_cents+? WHERE user_id=?").run(tx.amount_cents,tx.user_id);
-    db.prepare("UPDATE transactions SET status='completed',completed_at=CURRENT_TIMESTAMP WHERE id=?").run(tx.id);
-  });
-  run();
-  res.json({message:"Transação confirmada."});
-});
-
-app.post("/api/admin/transactions/:id/reject", auth, admin, (req,res) => {
-  const tx = db.prepare("SELECT * FROM transactions WHERE id=?").get(req.params.id);
-  if (!tx || tx.status !== "pending") return res.status(400).json({error:"Transação inválida."});
-  const run = db.transaction(() => {
-    if (tx.type === "withdrawal") db.prepare("UPDATE wallets SET available_cents=available_cents+? WHERE user_id=?").run(tx.amount_cents,tx.user_id);
-    db.prepare("UPDATE transactions SET status='rejected',completed_at=CURRENT_TIMESTAMP WHERE id=?").run(tx.id);
-  });
-  run();
-  res.json({message:"Transação rejeitada."});
-});
-
-app.use((req,res) => res.sendFile("index.html",{root:"public"}));
-
-app.listen(PORT, () => console.log(`NovaGás: http://localhost:${PORT}`));
+app.use((req,res)=>res.sendFile("index.html",{root:"public"}));
+app.listen(PORT,"0.0.0.0",()=>console.log(`NovaGás Backend em ${PORT}`));
